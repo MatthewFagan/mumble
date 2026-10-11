@@ -4,6 +4,8 @@
 // Mumble source tree or at <https://www.mumble.info/LICENSE>.
 
 #include "Connection.h"
+
+#include "Logger.h"
 #include "Mumble.pb.h"
 #include "SSL.h"
 
@@ -23,12 +25,13 @@
 HANDLE Connection::hQoS = nullptr;
 #endif
 
+using namespace mumble;
+
 Connection::Connection(QObject *p, QSslSocket *qtsSock) : QObject(p) {
 	qtsSocket = qtsSock;
 	qtsSocket->setParent(this);
 	iPacketLength        = -1;
 	bDisconnectedEmitted = false;
-	csCrypt              = std::make_unique< CryptStateOCB2 >();
 
 	static bool bDeclared = false;
 	if (!bDeclared) {
@@ -47,7 +50,6 @@ Connection::Connection(QObject *p, QSslSocket *qtsSock) : QObject(p) {
 	connect(qtsSocket, SIGNAL(disconnected()), this, SLOT(socketDisconnected()));
 	connect(qtsSocket, SIGNAL(sslErrors(const QList< QSslError > &)), this,
 			SLOT(socketSslErrors(const QList< QSslError > &)));
-	qtLastPacket.restart();
 #ifdef Q_OS_WIN
 	dwFlow = 0;
 #endif
@@ -57,26 +59,47 @@ Connection::~Connection() {
 #ifdef Q_OS_WIN
 	if (dwFlow && hQoS) {
 		if (!QOSRemoveSocketFromFlow(hQoS, 0, dwFlow, 0))
-			qWarning("Connection: Failed to remove flow from QoS");
+			warn("Connection: Failed to remove flow from QoS");
 	}
 #endif
 }
 
 void Connection::setToS() {
 #if defined(Q_OS_WIN)
-	if (dwFlow || !hQoS)
+	if (dwFlow || peerAddress().toAddress().isLoopback() || !hQoS) {
 		return;
+	}
 
-	dwFlow = 0;
 	if (!QOSAddSocketToFlow(hQoS, qtsSocket->socketDescriptor(), nullptr, QOSTrafficTypeAudioVideo,
 							QOS_NON_ADAPTIVE_FLOW, reinterpret_cast< PQOS_FLOWID >(&dwFlow)))
-		qWarning("Connection: Failed to add flow to QOS");
+		warn("Connection: Failed to add flow to QOS");
 #elif defined(Q_OS_UNIX)
-	int val = 0xa0;
-	if (setsockopt(static_cast< int >(qtsSocket->socketDescriptor()), IPPROTO_IP, IP_TOS, &val, sizeof(val))) {
+	const int fd = static_cast< int >(qtsSocket->socketDescriptor());
+	int val      = 0xa0;
+
+	auto setTos = [&](const int level, const int optname) {
+		if (setsockopt(fd, level, optname, &val, sizeof(val)) == 0) {
+			return true;
+		}
+
 		val = 0x60;
-		if (setsockopt(static_cast< int >(qtsSocket->socketDescriptor()), IPPROTO_IP, IP_TOS, &val, sizeof(val)))
-			qWarning("Connection: Failed to set TOS for TCP Socket");
+		return setsockopt(fd, level, optname, &val, sizeof(val)) == 0;
+	};
+
+	bool ok = false;
+	if (qtsSocket->peerAddress().protocol() == QAbstractSocket::IPv6Protocol) {
+		ok = setTos(IPPROTO_IPV6, IPV6_TCLASS);
+		// Dual-stack listen: peer may be IPv4-mapped on an AF_INET6 fd.
+		if (qtsSocket->peerAddress().toIPv4Address()) {
+			val = 0xa0;
+			setTos(IPPROTO_IP, IP_TOS);
+		}
+	} else {
+		ok = setTos(IPPROTO_IP, IP_TOS);
+	}
+
+	if (!ok) {
+		warn("Connection: Failed to set TOS/TCLASS");
 	}
 #	if defined(SO_PRIORITY)
 	socklen_t optlen = sizeof(val);
@@ -89,14 +112,6 @@ void Connection::setToS() {
 #	endif
 
 #endif
-}
-
-qint64 Connection::activityTime() const {
-	return qtLastPacket.elapsed();
-}
-
-void Connection::resetActivityTime() {
-	qtLastPacket.restart();
 }
 
 /**
@@ -129,7 +144,7 @@ void Connection::socketRead() {
 			return;
 
 		if (iPacketLength > 0x7fffff) {
-			qWarning() << "Host tried to send huge packet";
+			warn("Host tried to send huge packet");
 			disconnectSocket(true);
 			return;
 		}
@@ -158,8 +173,8 @@ void Connection::socketDisconnected() {
 	emit connectionClosed(QAbstractSocket::UnknownSocketError, QString());
 }
 
-void Connection::messageToNetwork(const ::google::protobuf::Message &msg, Mumble::Protocol::TCPMessageType msgType,
-								  QByteArray &cache) {
+[[nodiscard]] bool Connection::messageToNetwork(const ::google::protobuf::Message &msg,
+												Mumble::Protocol::TCPMessageType msgType, QByteArray &cache) {
 #if GOOGLE_PROTOBUF_VERSION >= 3004000
 	std::size_t len = msg.ByteSizeLong();
 #else
@@ -167,27 +182,27 @@ void Connection::messageToNetwork(const ::google::protobuf::Message &msg, Mumble
 	std::size_t len = msg.ByteSize();
 #endif
 	if (len > 0x7fffff)
-		return;
+		return false;
 	cache.resize(static_cast< int >(len + 6));
 	unsigned char *uc = reinterpret_cast< unsigned char * >(cache.data());
 	qToBigEndian< quint16 >(static_cast< quint16 >(msgType), &uc[0]);
 	qToBigEndian< quint32 >(static_cast< unsigned int >(len), &uc[2]);
 
-	msg.SerializeToArray(uc + 6, static_cast< int >(len));
-}
-
-void Connection::sendMessage(const ::google::protobuf::Message &msg, Mumble::Protocol::TCPMessageType msgType,
-							 QByteArray &cache) {
-	if (cache.isEmpty()) {
-		messageToNetwork(msg, msgType, cache);
+	bool success = msg.SerializeToArray(uc + 6, static_cast< int >(len));
+	if (!success) {
+		log::warn("Failed to serialize protobuf message");
+		cache.clear();
+		return false;
 	}
-
-	sendMessage(cache);
+	return true;
 }
 
 void Connection::sendMessage(const QByteArray &qbaMsg) {
-	if (!qbaMsg.isEmpty())
-		qtsSocket->write(qbaMsg);
+	if (qbaMsg.isEmpty() || qtsSocket->state() != QAbstractSocket::SocketState::ConnectedState) {
+		return;
+	}
+
+	qtsSocket->write(qbaMsg);
 }
 
 void Connection::forceFlush() {
@@ -212,7 +227,7 @@ void Connection::disconnectSocket(bool force) {
 		qtsSocket->disconnectFromHost();
 }
 
-QHostAddress Connection::peerAddress() const {
+HostAddress Connection::peerAddress() const {
 	return qtsSocket->peerAddress();
 }
 
@@ -220,12 +235,16 @@ quint16 Connection::peerPort() const {
 	return qtsSocket->peerPort();
 }
 
-QHostAddress Connection::localAddress() const {
+HostAddress Connection::localAddress() const {
 	return qtsSocket->localAddress();
 }
 
 quint16 Connection::localPort() const {
 	return qtsSocket->localPort();
+}
+
+QSslCertificate Connection::peerCertificate() const {
+	return qtsSocket->peerCertificate();
 }
 
 QList< QSslCertificate > Connection::peerCertificateChain() const {

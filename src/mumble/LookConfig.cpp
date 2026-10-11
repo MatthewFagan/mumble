@@ -234,6 +234,7 @@ void LookConfig::load(const Settings &r) {
 
 	loadCheckBox(qcbEnableDeveloperMenu, r.bEnableDeveloperMenu);
 	loadCheckBox(qcbLockLayout, (r.wlWindowLayout == Settings::LayoutCustom) && r.bLockLayout);
+	loadCheckBox(qcbRestoreWindowState, !r.preventWindowStates);
 	loadCheckBox(qcbHideTray, r.bHideInTray);
 	loadCheckBox(qcbStateInTray, r.bStateInTray);
 	loadCheckBox(qcbShowUserCount, r.bShowUserCount);
@@ -255,6 +256,7 @@ void LookConfig::load(const Settings &r) {
 	loadCheckBox(qcbAbbreviateChannelNames, r.bTalkingUI_AbbreviateChannelNames);
 	loadCheckBox(qcbAbbreviateCurrentChannel, r.bTalkingUI_AbbreviateCurrentChannel);
 	loadCheckBox(qcbShowLocalListeners, r.bTalkingUI_ShowLocalListeners);
+	loadCheckBox(qcbCtrlScrollLocalVolAdj, r.ctrlScrollLocalVolAdj);
 	qsbRelFontSize->setValue(r.iTalkingUI_RelativeFontSize);
 	qsbSilentUserLifetime->setValue(r.iTalkingUI_SilentUserLifeTime);
 	qsbChannelHierarchyDepth->setValue(r.iTalkingUI_ChannelHierarchyDepth);
@@ -309,6 +311,7 @@ void LookConfig::save() const {
 	s.quitBehavior              = static_cast< QuitBehavior >(qcbQuitBehavior->currentIndex());
 	s.bEnableDeveloperMenu      = qcbEnableDeveloperMenu->isChecked();
 	s.bLockLayout               = qcbLockLayout->isChecked();
+	s.preventWindowStates       = !qcbRestoreWindowState->isChecked();
 	s.bHideInTray               = qcbHideTray->isChecked();
 	s.bStateInTray              = qcbStateInTray->isChecked();
 	s.bShowUserCount            = qcbShowUserCount->isChecked();
@@ -345,6 +348,7 @@ void LookConfig::save() const {
 	s.bTalkingUI_AbbreviateChannelNames   = qcbAbbreviateChannelNames->isChecked();
 	s.bTalkingUI_AbbreviateCurrentChannel = qcbAbbreviateCurrentChannel->isChecked();
 	s.bTalkingUI_ShowLocalListeners       = qcbShowLocalListeners->isChecked();
+	s.ctrlScrollLocalVolAdj               = qcbCtrlScrollLocalVolAdj->isChecked();
 	s.iTalkingUI_RelativeFontSize         = qsbRelFontSize->value();
 	s.iTalkingUI_SilentUserLifeTime       = qsbSilentUserLifetime->value();
 	s.iTalkingUI_ChannelHierarchyDepth    = qsbChannelHierarchyDepth->value();

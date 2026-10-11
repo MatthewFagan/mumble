@@ -75,6 +75,7 @@
 #include <QtGui/QDesktopServices>
 #include <QtGui/QImageReader>
 #include <QtGui/QScreen>
+#include <QtGui/QWindow>
 #include <QtWidgets/QFileDialog>
 #include <QtWidgets/QInputDialog>
 #include <QtWidgets/QMessageBox>
@@ -92,6 +93,8 @@
 
 #include <algorithm>
 #include <optional>
+
+#include "widgets/EventFilters.h"
 
 MessageBoxEvent::MessageBoxEvent(QString m) : QEvent(static_cast< QEvent::Type >(MB_QEVENT)) {
 	msg = m;
@@ -176,6 +179,10 @@ MainWindow::MainWindow(QWidget *p)
 	connect(qteChat, SIGNAL(entered(QString)), this, SLOT(sendChatbarText(QString)));
 	connect(qteChat, &ChatbarTextEdit::ctrlEnterPressed, [this](const QString &msg) { sendChatbarText(msg, true); });
 	connect(qteChat, SIGNAL(pastedImage(QString)), this, SLOT(sendChatbarMessage(QString)));
+#ifdef Q_OS_MACOS
+	// Use default preferences icon in the macOS menu bar
+	qaConfigDialog->setIconVisibleInMenu(false);
+#endif
 
 	QObject::connect(qaServerAddToFavorites, &QAction::triggered, this, &MainWindow::addServerAsFavorite);
 
@@ -1423,24 +1430,62 @@ void MainWindow::setOnTop(bool top) {
 }
 
 void MainWindow::loadState(const bool minimalView) {
-	if (minimalView) {
-		if (!Global::get().s.qbaMinimalViewGeometry.isNull()) {
-			restoreGeometry(Global::get().s.qbaMinimalViewGeometry);
-		}
-		if (!Global::get().s.qbaMinimalViewState.isNull()) {
-			restoreState(Global::get().s.qbaMinimalViewState, stateVersion());
-		}
-	} else {
-		if (!Global::get().s.qbaMainWindowGeometry.isNull()) {
-			restoreGeometry(Global::get().s.qbaMainWindowGeometry);
-		}
-		if (!Global::get().s.qbaMainWindowState.isNull()) {
-			restoreState(Global::get().s.qbaMainWindowState, stateVersion());
-		}
+	// The Qt restoreGeometry and restoreState methods are very fragile and can crash the
+	// application. Even providing stateVersion() does not prevent all situations where a
+	// stored geometry or state will result in a crash loop.
+	// Hence, before trying to restore the state or geometry, we overwrite the current saved
+	// ones on disk. This prevents a crash loop as the second execution will have the variables
+	// unset. In case restoreGeometry and restoreState does not crash the application, we can
+	// save the geometry and state again to disk.
+	// See: https://github.com/mumble-voip/mumble/issues/7193
+
+	if (Global::get().s.preventWindowStates || Global::get().preventWindowStatesCLI) {
+		qWarning() << "Restoring window state and geometry is blocked by settings latch";
+		return;
 	}
+
+	QByteArray geometry;
+	QByteArray state;
+
+	if (minimalView) {
+		geometry                               = Global::get().s.qbaMinimalViewGeometry;
+		state                                  = Global::get().s.qbaMinimalViewState;
+		Global::get().s.qbaMinimalViewGeometry = QByteArray();
+		Global::get().s.qbaMinimalViewState    = QByteArray();
+	} else {
+		geometry                              = Global::get().s.qbaMainWindowGeometry;
+		state                                 = Global::get().s.qbaMainWindowState;
+		Global::get().s.qbaMainWindowGeometry = QByteArray();
+		Global::get().s.qbaMainWindowState    = QByteArray();
+	}
+
+	// This will remain true permanently, if we crash during restore
+	Global::get().s.preventWindowStates = true;
+	Global::get().s.save();
+
+	qInfo() << "Trying to restore window state and geometry";
+
+	if (!geometry.isEmpty()) {
+		restoreGeometry(geometry);
+	}
+
+	if (!state.isEmpty()) {
+		restoreState(state, stateVersion());
+	}
+
+	qInfo() << "Successfully restored window state and geometry";
+
+	// Write everything back as we did not crash during the restore
+	Global::get().s.preventWindowStates = false;
+	storeState(minimalView);
+	Global::get().s.save();
 }
 
 void MainWindow::storeState(const bool minimalView) {
+	if (Global::get().s.preventWindowStates || Global::get().preventWindowStatesCLI) {
+		return;
+	}
+
 	if (minimalView) {
 		Global::get().s.qbaMinimalViewGeometry = saveGeometry();
 		Global::get().s.qbaMinimalViewState    = saveState(stateVersion());
@@ -1663,8 +1708,14 @@ void MainWindow::on_qmServer_aboutToShow() {
 	qmServer->addAction(qaServerTokens);
 	qmServer->addAction(qaServerUserList);
 	qmServer->addAction(qaServerBanList);
+#ifndef Q_OS_MACOS
+	// On macOS, the "Quit" action is automatically placed in the application menu
+	// by Qt when the QAction's menuRole is set to QAction::QuitRole (see MainWindow.ui).
+	// Adding it manually to the "Server" menu would result in duplicate entries.
+	// See GitHub issue #7151: Move the Quit button to the "Mumble" application menu on macOS.
 	qmServer->addSeparator();
 	qmServer->addAction(qaQuit);
+#endif
 
 	qaServerBanList->setEnabled(Global::get().pPermissions & (ChanACL::Ban | ChanACL::Write));
 	qaServerUserList->setEnabled(Global::get().pPermissions & (ChanACL::Register | ChanACL::Write));
@@ -2098,7 +2149,7 @@ void MainWindow::on_qaUserLocalNickname_triggered() {
 
 void MainWindow::openUserLocalNicknameDialog(const ClientUser &p) {
 	unsigned int session = p.uiSession;
-	UserLocalNicknameDialog::present(session, qmUserNicknameTracker);
+	UserLocalNicknameDialog::present(session, qmUserNicknameTracker, this);
 }
 
 void MainWindow::on_qaUserCommentView_triggered() {
@@ -2853,7 +2904,7 @@ void MainWindow::on_qaPositionalAudioViewer_triggered() {
 	if (m_paViewer) {
 		m_paViewer->raise();
 	} else {
-		m_paViewer = std::make_unique< PositionalAudioViewer >();
+		m_paViewer = std::make_unique< PositionalAudioViewer >(this);
 		connect(m_paViewer.get(), &PositionalAudioViewer::finished, this, [this]() { m_paViewer.reset(); });
 		m_paViewer->show();
 	}
@@ -3692,10 +3743,10 @@ void MainWindow::serverDisconnected(QAbstractSocket::SocketError err, QString re
 			qmb.setEscapeButton(QMessageBox::No);
 
 			QPushButton *qp = qmb.addButton(tr("&View Certificate"), QMessageBox::ActionRole);
-			forever {
+			while (true) {
 				int res = qmb.exec();
 
-				if ((res == 0) && (qmb.clickedButton() == qp)) {
+				if (qmb.clickedButton() == qp) {
 					ViewCert vc(Global::get().sh->qscCert, this);
 					vc.exec();
 					continue;
@@ -3893,15 +3944,6 @@ void MainWindow::customEvent(QEvent *evt) {
 
 void MainWindow::on_qteLog_anchorClicked(const QUrl &url) {
 	if (!handleSpecialContextMenu(url, QCursor::pos(), true)) {
-#if defined(Q_OS_MAC) && defined(USE_OVERLAY)
-		// Clicking a link can cause the user's default browser to pop up while
-		// we're intercepting all events. This can be very confusing (because
-		// the user can't click on anything before they dismiss the overlay
-		// by hitting their toggle hotkey), so let's disallow clicking links
-		// when embedded into the overlay for now.
-		if (Global::get().ocIntercept)
-			return;
-#endif
 		if (url.scheme() != QLatin1String("file") && url.scheme() != QLatin1String("qrc") && !url.isRelative())
 			QDesktopServices::openUrl(url);
 	}
@@ -4007,11 +4049,22 @@ void MainWindow::destroyUserInformation() {
 }
 
 void MainWindow::openServerConnectDialog(bool autoconnect) {
+	// Wait for this window to be mapped before opening the dialog, otherwise
+	// Wayland compositors may not recognize the parent-child relationship.
+	if (!windowHandle() || !windowHandle()->isExposed()) {
+		// Ensure windowHandle() is non-null by forcing native window creation
+		setAttribute(Qt::WA_NativeWindow);
+		windowHandle()->installEventFilter(
+			new ExposeEventFilter(this, [this, autoconnect]() { openServerConnectDialog(autoconnect); }));
+		return;
+	}
+
 	ConnectDialog *cd = new ConnectDialog(this, autoconnect);
 	int res           = cd->exec();
 
-	if (cd->qsServer.isEmpty() || (cd->usPort == 0) || cd->qsUsername.isEmpty())
+	if (cd->qsServer.isEmpty() || (cd->usPort == 0) || cd->qsUsername.isEmpty()) {
 		res = QDialog::Rejected;
+	}
 
 	if (res == QDialog::Accepted) {
 		recreateServerHandler();
